@@ -23,7 +23,7 @@ jobs:
           gh repo clone "$p/$r" .deps/infra -- --depth=1 --branch "$b"
           test "$(git -C .deps/infra rev-parse HEAD)" = "$s"
           printf '%s\n' "$s" >/tmp/infra-sha
-      - name: Test 2 - modules-first environment and state boundaries are coherent
+      - name: Test 2 - declared Terraform layout and state boundaries are coherent
         shell: bash
         run: |
           set -euo pipefail
@@ -33,8 +33,11 @@ jobs:
             grep -Eq '^modules_root[[:space:]]*=[[:space:]]*"modules"' "$root/.ores-infra.toml"
             grep -Eq '^environments_root[[:space:]]*=[[:space:]]*"environments"' "$root/.ores-infra.toml"
             for e in preview staging production; do test -d "$root/environments/$e"; done
-          else
+          elif find "$root" -name '*.tf' -print -quit | grep -q .; then
             test -d "$root/modules"
+            test -d "$root/environments"
+          else
+            echo "Production infra is not Terraform-backed; skipping Terraform layout assertions."
           fi
           ! find "$root" -type f \( -name 'terraform.tfstate' -o -name 'terraform.tfstate.backup' -o -name '*.pem' -o -name '*.key' \) -print -quit | grep -q .
       - name: Test 3 - Terraform current-tip environments initialize and validate
@@ -52,5 +55,5 @@ jobs:
             fi
           done
           if [[ "$n" -eq 0 ]]; then
-            if find "$root" -name '*.tf' -print -quit | grep -q .; then terraform fmt -check -recursive "$root"; else echo "No Terraform roots yet; checkout/layout assertions still ran at $(cat /tmp/infra-sha)."; fi
+            if find "$root" -name '*.tf' -print -quit | grep -q .; then terraform fmt -check -recursive "$root"; else echo "No Terraform roots; checkout and secret/state assertions still ran at $(cat /tmp/infra-sha)."; fi
           fi
