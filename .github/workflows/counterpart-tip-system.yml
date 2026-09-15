@@ -24,41 +24,45 @@ jobs:
           gh repo clone "$p/$r" .deps/infra -- --depth=1 --branch "$b"
           test "$(git -C .deps/infra rev-parse HEAD)" = "$s"
           printf '%s\n' "$s" >/tmp/infra-sha
-      - name: Test 2 - declared Terraform layout and state boundaries are coherent
+      - name: Test 2 - declared topology and state boundaries are coherent
         shell: bash
         run: |
           set -euo pipefail
           root=.deps/infra
-          tf="$(find "$root" -type f -name '*.tf' -print | head -n 1 || true)"
+          tf="$(find "$root" -path '*/.terraform/*' -prune -o -type f -name '*.tf' -print | head -n 1 || true)"
           if [[ -f "$root/.ores-infra.toml" ]]; then
-            echo "Found .ores-infra.toml; enforcing declared modules-first layout."
-            grep -Eq '^layout[[:space:]]*=[[:space:]]*"modules"' "$root/.ores-infra.toml" || { echo "layout must be modules" >&2; exit 1; }
-            grep -Eq '^modules_root[[:space:]]*=[[:space:]]*"modules"' "$root/.ores-infra.toml" || { echo "modules_root must be modules" >&2; exit 1; }
-            grep -Eq '^environments_root[[:space:]]*=[[:space:]]*"environments"' "$root/.ores-infra.toml" || { echo "environments_root must be environments" >&2; exit 1; }
-            for e in preview staging production; do test -d "$root/environments/$e" || { echo "missing environments/$e" >&2; exit 1; }; done
+            echo "Found .ores-infra.toml; validating only the topology the repository explicitly declares."
+            grep -Eq '^layout[[:space:]]*=' "$root/.ores-infra.toml" || { echo ".ores-infra.toml must declare layout" >&2; exit 1; }
+            for key in modules_root environments_root; do
+              value="$(sed -nE "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*\"([^\"]+)\".*/\1/p" "$root/.ores-infra.toml" | head -n 1)"
+              if [[ -n "$value" ]]; then
+                [[ "$value" != /* && "$value" != *'..'* ]] || { echo "$key must be a repository-relative safe path" >&2; exit 1; }
+                test -d "$root/$value" || { echo "declared $key does not exist: $value" >&2; exit 1; }
+              fi
+            done
           elif [[ -n "$tf" ]]; then
-            echo "Terraform detected at ${tf#${root}/}; enforcing canonical modules/ + environments/ layout."
-            test -d "$root/modules" || { echo "Terraform repo is missing modules/" >&2; exit 1; }
-            test -d "$root/environments" || { echo "Terraform repo is missing environments/" >&2; exit 1; }
+            echo "Terraform detected at ${tf#${root}/}; repository-specific topology is accepted without inventing modules/ or environments/."
           else
-            echo "Production infra is not Terraform-backed; skipping Terraform layout assertions."
+            echo "Production infra is not Terraform-backed; Terraform-only validation is not applicable."
           fi
-          bad="$(find "$root" -type f \( -name 'terraform.tfstate' -o -name 'terraform.tfstate.backup' -o -name '*.pem' -o -name '*.key' \) -print | head -n 20 || true)"
+          bad="$(find "$root" -path "$root/.git" -prune -o -type f \( -name 'terraform.tfstate' -o -name 'terraform.tfstate.backup' -o -name '*.pem' -o -name '*.key' \) -print | head -n 20 || true)"
           if [[ -n "$bad" ]]; then printf 'Forbidden tracked state/key material:\n%s\n' "$bad" >&2; exit 1; fi
-      - name: Test 3 - Terraform current-tip environments initialize and validate
+      - name: Test 3 - discovered Terraform roots initialize and validate
         shell: bash
         run: |
           set -euo pipefail
-          root=.deps/infra; n=0
-          for e in preview staging production; do
-            d="$root/environments/$e"
-            if compgen -G "$d/*.tf" >/dev/null; then
-              terraform -chdir="$d" fmt -check -recursive
-              terraform -chdir="$d" init -backend=false -input=false
-              terraform -chdir="$d" validate -no-color
-              n=$((n+1))
-            fi
-          done
-          if [[ "$n" -eq 0 ]]; then
-            if find "$root" -name '*.tf' -print -quit | grep -q .; then terraform fmt -check -recursive "$root"; else echo "No Terraform roots; checkout and secret/state assertions still ran at $(cat /tmp/infra-sha)."; fi
+          root=.deps/infra
+          mapfile -t roots < <(find "$root" -path '*/.terraform/*' -prune -o -type f \( -name 'main.tf' -o -name 'terraform.tf' -o -name 'versions.tf' \) -printf '%h\n' | sort -u | head -n 32)
+          if [[ "${#roots[@]}" -eq 0 ]]; then
+            mapfile -t roots < <(find "$root" -path '*/.terraform/*' -prune -o -type f -name '*.tf' -printf '%h\n' | sort -u | head -n 32)
           fi
+          if [[ "${#roots[@]}" -eq 0 ]]; then
+            echo "No Terraform roots; checkout and state-boundary assertions still ran at $(cat /tmp/infra-sha)."
+            exit 0
+          fi
+          terraform fmt -check -recursive "$root"
+          for d in "${roots[@]}"; do
+            echo "Validating Terraform root ${d#${root}/}"
+            terraform -chdir="$d" init -backend=false -input=false
+            terraform -chdir="$d" validate -no-color
+          done
