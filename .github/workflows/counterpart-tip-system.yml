@@ -1,0 +1,68 @@
+name: counterpart-tip infra recovery system
+on: { pull_request: {}, push: { branches: [main] }, workflow_dispatch: {} }
+permissions: { contents: read }
+jobs:
+  current-production-infra:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env: { GH_TOKEN: "${{ secrets.TEST_FLEET_GITHUB_TOKEN || github.token }}" }
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with: { persist-credentials: false }
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e
+        with: { terraform_version: 1.16.2, terraform_wrapper: false }
+      - name: Test 1 - clone exact current production infra tip
+        shell: bash
+        run: |
+          set -euo pipefail
+          p="${GITHUB_REPOSITORY_OWNER%-test}"
+          gh api --paginate "orgs/$p/repos?per_page=100&type=all" --jq '.[]|select(.archived==false)|[.name,.default_branch]|@tsv' >/tmp/repos
+          i="$(awk -F '\t' '$1~/(^infra$|-infra$|\.infra$)/{print;exit}' /tmp/repos)"
+          test -n "$i" || { echo "No production infra visible; configure TEST_FLEET_GITHUB_TOKEN or add the canonical *-infra repo" >&2; exit 1; }
+          r="${i%%$'\t'*}"; b="${i#*$'\t'}"; s="$(gh api "repos/$p/$r/commits/$b" --jq .sha)"
+          echo "Testing ${p}/${r}@${s}"
+          gh repo clone "$p/$r" .deps/infra -- --depth=1 --branch "$b"
+          test "$(git -C .deps/infra rev-parse HEAD)" = "$s"
+          printf '%s\n' "$s" >/tmp/infra-sha
+      - name: Test 2 - declared topology and state boundaries are coherent
+        shell: bash
+        run: |
+          set -euo pipefail
+          root=.deps/infra
+          tf="$(find "$root" -path '*/.terraform/*' -prune -o -type f -name '*.tf' -print | head -n 1 || true)"
+          if [[ -f "$root/.ores-infra.toml" ]]; then
+            echo "Found .ores-infra.toml; validating only the topology the repository explicitly declares."
+            grep -Eq '^layout[[:space:]]*=' "$root/.ores-infra.toml" || { echo ".ores-infra.toml must declare layout" >&2; exit 1; }
+            for key in modules_root environments_root; do
+              value="$(sed -nE "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*\"([^\"]+)\".*/\1/p" "$root/.ores-infra.toml" | head -n 1)"
+              if [[ -n "$value" ]]; then
+                [[ "$value" != /* && "$value" != *'..'* ]] || { echo "$key must be a repository-relative safe path" >&2; exit 1; }
+                test -d "$root/$value" || { echo "declared $key does not exist: $value" >&2; exit 1; }
+              fi
+            done
+          elif [[ -n "$tf" ]]; then
+            echo "Terraform detected at ${tf#${root}/}; repository-specific topology is accepted without inventing modules/ or environments/."
+          else
+            echo "Production infra is not Terraform-backed; Terraform-only validation is not applicable."
+          fi
+          bad="$(find "$root" -path "$root/.git" -prune -o -type f \( -name 'terraform.tfstate' -o -name 'terraform.tfstate.backup' -o -name '*.pem' -o -name '*.key' \) -print | head -n 20 || true)"
+          if [[ -n "$bad" ]]; then printf 'Forbidden tracked state/key material:\n%s\n' "$bad" >&2; exit 1; fi
+      - name: Test 3 - discovered Terraform roots initialize and validate
+        shell: bash
+        run: |
+          set -euo pipefail
+          root=.deps/infra
+          mapfile -t roots < <(find "$root" -path '*/.terraform/*' -prune -o -type f \( -name 'main.tf' -o -name 'terraform.tf' -o -name 'versions.tf' \) -printf '%h\n' | sort -u | head -n 32)
+          if [[ "${#roots[@]}" -eq 0 ]]; then
+            mapfile -t roots < <(find "$root" -path '*/.terraform/*' -prune -o -type f -name '*.tf' -printf '%h\n' | sort -u | head -n 32)
+          fi
+          if [[ "${#roots[@]}" -eq 0 ]]; then
+            echo "No Terraform roots; checkout and state-boundary assertions still ran at $(cat /tmp/infra-sha)."
+            exit 0
+          fi
+          terraform fmt -check -recursive "$root"
+          for d in "${roots[@]}"; do
+            echo "Validating Terraform root ${d#${root}/}"
+            terraform -chdir="$d" init -backend=false -input=false
+            terraform -chdir="$d" validate -no-color
+          done
